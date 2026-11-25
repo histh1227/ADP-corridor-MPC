@@ -514,3 +514,471 @@ def _boxes_k(active, act_ok, act_s, act_x, act_y, act_d, MW, W, s_car, L, win_hi
         labels[i] = np.searchsorted(rs, roots[i])
     return _clusters_k(labels, nc, rel, dd)
 
+
+
+@njit(cache=True)
+def _lat_sim_k(Ti, Vc, Lc, vL, t0, n):
+    v = vL.copy()
+    ok = True
+    for k in range(n):
+        tk = t0 + 0.01 * k + 1e-6
+        for j in range(Lc.shape[0]):
+            i = Ti.shape[0] - 1
+            while i >= 0 and Ti[i] > tk - Lc[j]:
+                i -= 1
+            if i < 0:
+                ok = False
+                i = 0
+            vj = v[j]
+            dv = Vc[i] - vj
+            if vj > 0.0:
+                kp = KP_ACC if dv > 0 else KP_BRK
+            else:
+                kp = 0.951 if dv > 0 else 3.804
+            a = kp * dv
+            pos = A_MAX * V_SWITCH / vj if vj > V_SWITCH else A_MAX
+            if a > pos:
+                a = pos
+            if a < -A_MAX:
+                a = -A_MAX
+            v[j] = vj + 0.01 * a
+    return v, ok
+
+
+@njit(cache=True)
+def _expm_fr_k(M):
+    nb = M.shape[0]
+    out = np.zeros((nb, 7, 7))
+    A = np.zeros((7, 7))
+    T = np.zeros((7, 7))
+    T2 = np.zeros((7, 7))
+    E = np.zeros((7, 7))
+    for b in range(nb):
+        nrm = 0.0
+        for i in range(5):
+            ssum = 0.0
+            for j in range(7):
+                ssum += abs(M[b, i, j])
+            if ssum > nrm:
+                nrm = ssum
+        s = 0
+        if nrm > 0.5:
+            s = int(math.ceil(math.log(nrm / 0.5) / math.log(2.0)))
+        sc = 1.0 / (2.0 ** s)
+        for i in range(7):
+            for j in range(7):
+                A[i, j] = M[b, i, j] * sc
+                T[i, j] = A[i, j]
+                E[i, j] = A[i, j] + (1.0 if i == j else 0.0)
+        a01, a02, a06 = A[0, 1], A[0, 2], A[0, 6]
+        a10, a11, a12, a13, a16 = A[1, 0], A[1, 1], A[1, 2], A[1, 3], A[1, 6]
+        a22, a23, a24, a32, a33, a34, a45 = A[2, 2], A[2, 3], A[2, 4], A[3, 2], A[3, 3], A[3, 4], A[4, 5]
+        for p in range(2, 11):
+            for i in range(5):
+                t0, t1, t2, t3, t4 = T[i, 0], T[i, 1], T[i, 2], T[i, 3], T[i, 4]
+                T2[i, 0] = (t1 * a10) / p
+                T2[i, 1] = (t0 * a01 + t1 * a11) / p
+                T2[i, 2] = (t0 * a02 + t1 * a12 + t2 * a22 + t3 * a32) / p
+                T2[i, 3] = (t1 * a13 + t2 * a23 + t3 * a33) / p
+                T2[i, 4] = (t2 * a24 + t3 * a34) / p
+                T2[i, 5] = (t4 * a45) / p
+                T2[i, 6] = (t0 * a06 + t1 * a16) / p
+            for i in range(5):
+                for j in range(7):
+                    T[i, j] = T2[i, j]
+                    E[i, j] += T2[i, j]
+        for _ in range(s):
+            for i in range(5):
+                for j in range(7):
+                    acc = 0.0
+                    for q in range(5):
+                        acc += E[i, q] * E[q, j]
+                    if j == 5:
+                        acc += E[i, 5]
+                    elif j == 6:
+                        acc += E[i, 6]
+                    T2[i, j] = acc
+            for i in range(5):
+                for j in range(7):
+                    E[i, j] = T2[i, j]
+        for i in range(7):
+            for j in range(7):
+                out[b, i, j] = E[i, j]
+    return out
+
+
+@njit(cache=True)
+def _corr1(s, wlo, whi, nf, fds, bx, bsd, w_h):
+    i = int(np.rint(s / fds)) % nf
+    lo = wlo[i]
+    hi = whi[i]
+    for b in range(bx.shape[0]):
+        if bsd[b] == 0 or s < bx[b, 0] or s > bx[b, 1]:
+            continue
+        if bsd[b] > 0:
+            v = bx[b, 3] + w_h
+            if v > lo:
+                lo = v
+        else:
+            v = bx[b, 2] - w_h
+            if v < hi:
+                hi = v
+    return lo, hi
+
+
+@njit(cache=True)
+def _mpc_hp_k(st, X0, Xbar, kr, vpred, acc, dpl, dpath, lpts, wlo, whi, nf, fds, bx, bsd, w_h, v_min_plan, c_pref,
+              q_d, q_mu, q_a, a_lat_hard, tab_plan, bA, bB, bb, bQ, bq, bC, blg, bug, blbx, bubx, cmu, lgc, ugc, dt,
+              c_ty):
+    N = dpl.shape[0]
+    nl = lpts.shape[0]
+    vp = np.empty(N + 1)
+    for k in range(N + 1):
+        vp[k] = vpred[k] if vpred[k] > v_min_plan else v_min_plan
+    M = np.zeros((N, 7, 7))
+    for k in range(N):
+        vi = vp[k]
+        a = acc[k]
+        a = -A_MAX if a < -A_MAX else (A_MAX if a > A_MAX else a)
+        cf = c_ty * MU_ * CSF_ * (G_ * LR_ - a * HCG_)
+        cr = c_ty * MU_ * CSR_ * (G_ * LF_ + a * HCG_)
+        a11 = -(cr + cf) / (vi * WB)
+        a12 = (cr * LR_ - cf * LF_) / (vi * vi * WB) - 1.0
+        b1 = cf / (vi * WB)
+        a21 = M_ * (cr * LR_ - cf * LF_) / (I_ * WB)
+        a22 = -M_ * (LF_ * LF_ * cf + LR_ * LR_ * cr) / (vi * I_ * WB)
+        b2 = M_ * LF_ * cf / (I_ * WB)
+        dbar = Xbar[k, 0]
+        chib = Xbar[k, 1] + Xbar[k, 2]
+        cb = math.cos(chib)
+        sb = math.sin(chib)
+        Dk = 1.0 - kr[k] * dbar
+        if Dk < 0.2:
+            Dk = 0.2
+        krr = kr[k]
+        cd = -krr * krr * vi * cb / Dk ** 2
+        cm = krr * vi * sb / Dk
+        dt[k] = dpl[k] / vi
+        h = dt[k]
+        M[k, 0, 1] = vi * cb * h
+        M[k, 0, 2] = vi * cb * h
+        M[k, 0, 6] = vi * (sb - cb * chib) * h
+        M[k, 1, 0] = cd * h
+        M[k, 1, 1] = cm * h
+        M[k, 1, 2] = cm * h
+        M[k, 1, 3] = h
+        M[k, 1, 6] = (-krr * vi * cb / Dk - cd * dbar - cm * chib) * h
+        M[k, 2, 2] = a11 * h
+        M[k, 2, 3] = a12 * h
+        M[k, 2, 4] = b1 * h
+        M[k, 3, 2] = a21 * h
+        M[k, 3, 3] = a22 * h
+        M[k, 3, 4] = b2 * h
+        M[k, 4, 5] = h
+    E = _expm_fr_k(M)
+    for k in range(N):
+        for i in range(5):
+            for j in range(5):
+                bA[k, i, j] = E[k, j, i]
+            bB[k, 0, i] = E[k, i, 5]
+            bb[k, i] = E[k, i, 6]
+    v0_ = vp[0]
+    x = v0_ if v0_ > 0.0 else 0.0
+    ab = tab_plan[min(int(x * 20.0), tab_plan.shape[0] - 1)]
+    cum = 0.0
+    for k in range(N + 1):
+        if k > 0:
+            cum += dpl[k - 1]
+        la, ha = _corr1(st[k], wlo, whi, nf, fds, bx, bsd, w_h)
+        lb, hb = _corr1(st[k] + BOX_FRONT, wlo, whi, nf, fds, bx, bsd, w_h)
+        loc = la if la > lb else lb
+        hic = ha if ha < hb else hb
+        dr = dpath[k]
+        if dr < loc + c_pref:
+            dr = loc + c_pref
+        if dr > hic - c_pref:
+            dr = hic - c_pref
+        if hic - loc < 2 * c_pref:
+            dr = 0.5 * (loc + hic)
+        vsq = v0_ * v0_ - 2.0 * ab * cum
+        vreach = math.sqrt(vsq if vsq > 1.0 else 1.0)
+        vlat = vp[k] if vp[k] < vreach else vreach
+        wa = q_a * (vp[k] * vp[k])
+        for i in range(5):
+            for j in range(5):
+                bQ[k, i, j] = 0.0
+            bq[k, i] = 0.0
+            for j in range(nl + 1):
+                bC[k, i, j] = 0.0
+        if k == 0:
+            for i in range(5):
+                bQ[0, i, i] = 2e-6
+            for j in range(nl + 1):
+                blg[0, j] = 0.0
+                bug[0, j] = 0.0
+            for i in range(5):
+                blbx[0, i] = X0[i]
+                bubx[0, i] = X0[i]
+            continue
+        bQ[k, 0, 0] = 2 * q_d
+        bQ[k, 1, 1] = 2 * q_mu
+        bQ[k, 2, 2] = 2e-6
+        bQ[k, 3, 3] = 2 * wa
+        bQ[k, 4, 4] = 2e-6
+        bq[k, 0] = -2 * q_d * dr
+        bq[k, 3] = -2 * wa * vp[k] * kr[k]
+        mb = Xbar[k, 1]
+        cmy = math.cos(mb)
+        smy = math.sin(mb)
+        Dk = 1.0 - kr[k] * Xbar[k, 0]
+        if Dk < 0.2:
+            Dk = 0.2
+        keff = kr[k] / Dk
+        for j in range(nl):
+            lp = lpts[j]
+            lo, hi = _corr1(st[k] + lp * cmy / Dk, wlo, whi, nf, fds, bx, bsd, w_h)
+            const = lp * (smy - cmy * mb) - keff * lp * lp / 2
+            lo = lo - const
+            hi = hi - const
+            if lo > hi:
+                lo = hi = 0.5 * (lo + hi)
+            cmu[k - 1, j] = lp * cmy
+            lgc[k - 1, j] = lo
+            ugc[k - 1, j] = hi
+            bC[k, 0, j] = 1.0
+            bC[k, 1, j] = lp * cmy
+            blg[k, j] = lo
+            bug[k, j] = hi
+        bC[k, 3, nl] = vlat
+        blg[k, nl] = -a_lat_hard
+        bug[k, nl] = a_lat_hard
+        blbx[k, 0] = -STEER_MAX * 0.98
+        bubx[k, 0] = STEER_MAX * 0.98
+
+
+@njit(cache=True)
+def _targets_k(H, tt, tl, tb):
+    hd, dl, hv, vc = False, 0.0, False, 0.0
+    ts0 = tt + 1e-6 - tl - tb
+    tv0 = tt + 1e-6 - tl
+    for i in range(H.shape[0]):
+        if H[i, 0] <= ts0:
+            dl = H[i, 1]
+            hd = True
+        if H[i, 0] <= tv0:
+            vc = H[i, 2]
+            hv = True
+    return hd, dl, hv, vc
+
+
+@njit(cache=True)
+def _servo_k(delta, has, tgt):
+    if not has:
+        return delta
+    diff = tgt - delta
+    step = STEER_RATE * 0.01
+    if abs(diff) > 1e-4:
+        delta += max(-step, min(step, diff))
+    return max(-STEER_MAX, min(STEER_MAX, delta))
+
+
+@njit(cache=True)
+def _p_accel_k(v_cmd, v):
+    dv = v_cmd - v
+    if v > 0.0:
+        a = (KP_ACC if dv > 0 else KP_BRK) * dv
+    else:
+        a = (2.0 * 9.51 / 20.0 if dv > 0 else 2.0 * 9.51 / 5.0) * dv
+    pos = A_MAX * V_SWITCH / v if v > V_SWITCH else A_MAX
+    return max(-A_MAX, min(pos, a))
+
+
+@njit(cache=True)
+def _bicycle_s_k(v, a, c):
+    a = -A_MAX if a < -A_MAX else (A_MAX if a > A_MAX else a)
+    cf = c * MU_ * CSF_ * (G_ * LR_ - a * HCG_)
+    cr = c * MU_ * CSR_ * (G_ * LF_ + a * HCG_)
+    vl = v * WB
+    return (
+        -(cr + cf) / vl,
+        (cr * LR_ - cf * LF_) / (v * vl) - 1.0,
+        cf / vl,
+        M_ * (cr * LR_ - cf * LF_) / (I_ * WB),
+        -M_ * (LF_ * LF_ * cf + LR_ * LR_ * cr) / (v * I_ * WB),
+        M_ * LF_ * cf / (I_ * WB),
+    )
+
+
+@njit(cache=True)
+def _obs_main_k(H, tl, tb, t0, n, vf0, delta):
+    m = max(n, 1)
+    dmain = np.empty(m)
+    amain = np.empty(m)
+    vms = np.empty(m)
+    vck = np.zeros(m)
+    hvk = np.zeros(m, np.bool_)
+    vm = vf0
+    for k in range(n):
+        hd, tgt, hv, vc = _targets_k(H, t0 + 0.01 * k, tl, tb)
+        delta = _servo_k(delta, hd, tgt)
+        a = _p_accel_k(vc, vm) if hv else 0.0
+        dmain[k] = delta
+        amain[k] = a
+        vms[k] = vm
+        vck[k] = vc
+        hvk[k] = hv
+        vm = max(0.0, vm + a * 0.01)
+    return delta, vm, dmain, amain, vms, vck, hvk
+
+
+@njit(cache=True)
+def _obs_beta_k(n, vf0, vf, rf0, rf, yawf0, dyw, xf0, yf0, beta, dk, vck, hvk, c):
+    has_mid = False
+    beta_mid = 0.0
+    px_ = xf0
+    py_ = yf0
+    for k in range(n):
+        b_before = beta
+        f = (k + 0.5) / max(n, 1)
+        vk = vf0 + (vf - vf0) * f
+        rk = rf0 + (rf - rf0) * f
+        a = _p_accel_k(vck[k], vk) if hvk[k] else 0.0
+        yk = yawf0 + dyw * f
+        if vk >= 0.5:
+            a11, a12, b1, _, _, _ = _bicycle_s_k(vk, a, c)
+            e = math.exp(a11 * 0.01)
+            bss = -(a12 * rk + b1 * dk[k]) / a11
+            bmid_ = bss + (beta - bss) * math.exp(a11 * 0.005)
+            beta = bss + (beta - bss) * e
+        else:
+            bmid_ = 0.0
+            beta = 0.0
+        px_ += vk * math.cos(yk + bmid_) * 0.01
+        py_ += vk * math.sin(yk + bmid_) * 0.01
+        h2 = 2 * (k + 1)
+        if h2 == n:
+            beta_mid = beta
+            has_mid = True
+        elif h2 == n + 1:
+            beta_mid = 0.5 * (b_before + beta)
+            has_mid = True
+    return beta, has_mid, beta_mid, px_, py_
+
+
+@njit(cache=True)
+def _mm_prop(bb, rr, dg, cv, lg, nc, H, tl, tb, t0, n, vf0, v, dmain, amain, vms):
+    nl = lg.shape[0]
+    NH = H.shape[0]
+    NM = bb.shape[0]
+    dvec = np.empty(NM)
+    avec = np.empty(NM)
+    ag = np.empty(nl)
+    h = 0.01
+    for k in range(n):
+        tt = t0 + 0.01 * k
+        vk = vf0 + (v - vf0) * (k + 0.5) / max(n, 1)
+        for l in range(nl):
+            tq = tt - lg[l] + 1e-6
+            ts0 = tq - tl - tb
+            tv0 = tq - tl
+            tg = dg[l]
+            vc = vk
+            for j in range(NH - 1, -1, -1):
+                if H[j, 0] <= ts0:
+                    tg = H[j, 1]
+                    break
+            for j in range(NH - 1, -1, -1):
+                if H[j, 0] <= tv0:
+                    vc = H[j, 2]
+                    break
+            diff = tg - dg[l]
+            if abs(diff) > 1e-4:
+                dg[l] += min(max(diff, -STEER_RATE * 0.01), STEER_RATE * 0.01)
+            dg[l] = min(max(dg[l], -STEER_MAX), STEER_MAX)
+            dvc = vc - vk
+            a = ((KP_ACC if dvc > 0 else KP_BRK) * dvc) if vk > 0.0 else 0.0
+            amax = A_MAX * V_SWITCH / vk if vk > V_SWITCH else A_MAX
+            ag[l] = min(max(a, -A_MAX), amax)
+        dvec[0] = dmain[k]
+        avec[0] = amain[k]
+        for l in range(nl):
+            for i in range(nc):
+                dvec[1 + l * nc + i] = dg[l]
+                avec[1 + l * nc + i] = ag[l]
+        vm = vms[k]
+        if vm >= 0.5:
+            for i in range(NM):
+                cf = cv[i] * MU_ * CSF_ * (G_ * LR_ - avec[i] * HCG_)
+                cr = cv[i] * MU_ * CSR_ * (G_ * LF_ + avec[i] * HCG_)
+                a11 = -(cr + cf) / (vm * WB)
+                a12 = (cr * LR_ - cf * LF_) / (vm * vm * WB) - 1.0
+                a21 = M_ * (cr * LR_ - cf * LF_) / (I_ * WB)
+                a22 = -M_ * (LF_ * LF_ * cf + LR_ * LR_ * cr) / (vm * I_ * WB)
+                ub = cf / (vm * WB) * dvec[i]
+                ur = M_ * LF_ * cf / (I_ * WB) * dvec[i]
+                b0, r0 = bb[i], rr[i]
+                k1b = a11 * b0 + a12 * r0 + ub
+                k1r = a21 * b0 + a22 * r0 + ur
+                b_, r_ = b0 + 0.5 * h * k1b, r0 + 0.5 * h * k1r
+                k2b = a11 * b_ + a12 * r_ + ub
+                k2r = a21 * b_ + a22 * r_ + ur
+                b_, r_ = b0 + 0.5 * h * k2b, r0 + 0.5 * h * k2r
+                k3b = a11 * b_ + a12 * r_ + ub
+                k3r = a21 * b_ + a22 * r_ + ur
+                b_, r_ = b0 + h * k3b, r0 + h * k3r
+                k4b = a11 * b_ + a12 * r_ + ub
+                k4r = a21 * b_ + a22 * r_ + ur
+                bb[i] = b0 + h / 6.0 * (k1b + 2.0 * k2b + 2.0 * k3b + k4b)
+                rr[i] = r0 + h / 6.0 * (k1r + 2.0 * k2r + 2.0 * k3r + k4r)
+        else:
+            for i in range(NM):
+                bb[i] = 0.0
+                rr[i] = vm * math.tan(dvec[i]) / WB
+
+
+@njit(cache=True)
+def _predict_k(H, tl, tb, t, x, y, yaw, v, r, t_pred, delta, beta, c):
+    n = int(round(t_pred / 0.01))
+    a = 0.0
+    for k in range(n):
+        tt = t + 0.01 * k
+        hd, tgt, hv, vc = _targets_k(H, tt, tl, tb)
+        delta = _servo_k(delta, hd, tgt)
+        a = _p_accel_k(vc, v) if hv else 0.0
+        if v >= 0.5:
+            a11, a12, b1, a21, a22, b2 = _bicycle_s_k(v, a, c)
+            m = max(1, int(math.ceil(-0.01 * min(a11, a22) / 0.7)))
+            h = 0.01 / m
+            for _ in range(m):
+                bd = a11 * beta + a12 * r + b1 * delta
+                rd = a21 * beta + a22 * r + b2 * delta
+                x += v * math.cos(yaw + beta) * h
+                y += v * math.sin(yaw + beta) * h
+                yaw += r * h
+                beta += bd * h
+                r += rd * h
+        else:
+            x += v * math.cos(yaw) * 0.01
+            y += v * math.sin(yaw) * 0.01
+            r = v * math.tan(delta) / WB
+            yaw += r * 0.01
+            beta = 0.0
+        v = max(0.0, v + a * 0.01)
+    return x, y, yaw, v, beta, r, delta, a
+
+
+@njit(cache=True)
+def _hp_slack_k(Xs, cmu, lgc, ugc):
+    N, nl = cmu.shape
+    sl = np.zeros(N + 1)
+    for k in range(N):
+        m = 0.0
+        for j in range(nl):
+            val = Xs[k + 1, 0] + cmu[k, j] * Xs[k + 1, 1]
+            if lgc[k, j] - val > m:
+                m = lgc[k, j] - val
+            if val - ugc[k, j] > m:
+                m = val - ugc[k, j]
+        sl[k + 1] = m
+    return sl
+

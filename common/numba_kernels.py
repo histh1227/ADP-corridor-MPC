@@ -982,3 +982,85 @@ def _hp_slack_k(Xs, cmu, lgc, ugc):
         sl[k + 1] = m
     return sl
 
+
+@njit(cache=True)
+def _cmd_sim(vprof, cum, dpl, v0, a0, a_acc, jerk, tab_emerg, t_call):
+    N = dpl.shape[0]
+    vs = np.empty(N + 1)
+    acc = np.empty(N)
+    nt = tab_emerg.shape[0]
+    v = v0 if v0 > 0.0 else 0.0
+    a = a0
+    vs[0] = v
+    for k in range(N):
+        s_ahead = 0.1 * v
+        if s_ahead < 0.3:
+            s_ahead = 0.3
+        sq = cum[k] + s_ahead
+        j = k
+        while j < N and cum[j + 1] < sq:
+            j += 1
+        if j >= N:
+            vt = vprof[N]
+        else:
+            f = (sq - cum[j]) / max(cum[j + 1] - cum[j], 1e-9)
+            vt = vprof[j] * (1.0 - f) + vprof[j + 1] * f
+        ad = (vt * vt - v * v) / (2.0 * s_ahead)
+        ab = tab_emerg[min(int(v * 20.0), nt - 1)]
+        if ad < -ab:
+            ad = -ab
+        if ad > a_acc:
+            ad = a_acc
+        vm = v if v > 0.5 else 0.5
+        dt = dpl[k] / vm
+        dj = jerk * (dt if dt > t_call else t_call)
+        if ad > a + dj:
+            ad = a + dj
+        if ad < a - dj:
+            ad = a - dj
+        if v > 7.319 and ad > 9.51 * 7.319 / v:
+            ad = 9.51 * 7.319 / v
+        a = ad
+        acc[k] = a
+        v2 = v * v + 2.0 * a * dpl[k]
+        v = math.sqrt(v2) if v2 > 0.0 else 0.0
+        vs[k + 1] = v
+    return vs, acc
+
+
+@njit(cache=True)
+def _plan_prep_k(st, fk, L, fds, sol_st, sol_X, dpath, X0, prof_s, prof_dpl, prof_vf, pv, a_cmd, a_acc_eff, jerk,
+                 tab_emerg, t_call):
+    N1 = st.shape[0]
+    nf = fk.shape[0]
+    kr = np.empty(N1)
+    for i in range(N1):
+        u = (st[i] % L) / fds
+        fu = math.floor(u)
+        i0 = int(fu) % nf
+        f = u - fu
+        kr[i] = fk[i0] * (1 - f) + fk[(i0 + 1) % nf] * f
+    Xbar = np.empty((N1, 5))
+    s_end = sol_st[sol_st.shape[0] - 1]
+    for i in range(N1):
+        if st[i] > s_end:
+            Xbar[i, 0] = dpath[i]
+            for k in range(1, 5):
+                Xbar[i, k] = 0.0
+        else:
+            for k in range(5):
+                Xbar[i, k] = _interp1(st[i], sol_st, sol_X[:, k])
+    for k in range(5):
+        Xbar[0, k] = X0[k]
+    N = N1 - 1
+    dpl = np.empty(N)
+    cum0 = np.empty(N1)
+    cum0[0] = 0.0
+    vtarget = np.empty(N1)
+    for i in range(N1):
+        vtarget[i] = _interp1(st[i], prof_s, prof_vf)
+        if i < N:
+            dpl[i] = _interp1(st[i], prof_s[:N], prof_dpl)
+            cum0[i + 1] = cum0[i] + dpl[i]
+    vpred, acc = _cmd_sim(vtarget, cum0, dpl, pv, a_cmd, a_acc_eff, jerk, tab_emerg, t_call)
+    return kr, Xbar, dpl, vpred, acc

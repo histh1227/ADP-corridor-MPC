@@ -1,0 +1,20 @@
+{
+  "a_lat": 14.0,
+  "a_lat_hard": 14.0,
+  "lat_alat": [0.06, 0.07, 12.0],
+  "a_acc": 7.5,
+  "jerk": 120.0,
+  "v_max": 11.0,
+  "v_vis_safe": 2.0,
+  "min_gap_w": 0.10,
+  "min_gap_keep": 0.07,
+  "w_front": 2.8,
+  "v_hz": 0.5,
+  "v_slow": 1.5,
+  "creep_chk": 0.2,
+  "creep_slack": 0.05,
+  "prox_v": 3.0,
+  "mu_max": 1.6,
+  "fg_check": false,
+  "scan_median_win": 0
+}

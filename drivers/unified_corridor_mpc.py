@@ -166,7 +166,6 @@ class UnifiedCorridorMPC:
         self.odo = 0.0
         self.t_odo = None
         self._creep_blocked = False
-        self.loc_degraded = False
 
     def _clock(self, t):
         if self.t_off is None:
@@ -289,28 +288,6 @@ class UnifiedCorridorMPC:
         return dict(t=t, st=st, Xs=Xs, dts=dts, vprof=vprof, cum=cum, emergency=emergency,
                     slack=slack, s_vis=s_vis, bad=bad, acc=acc_mpc, failed=out is None)
 
-    def _can_reuse_plan(self, old, t: float, s0: float, vv: float) -> bool:
-        """MPC 풀이 실패 시 이전 계획을 재사용해도 안전한지 검증한다.
-
-        정상 랩에서는 호출되지 않으며(연산량 0 증가), 실패 분기에서만 실행된다.
-        조건:
-          1. 직전 계획이 정상이고 0.12 s 미만이며 연속 실패가 2회 이하
-          2. 위치추정이 정상 상태(not self.loc_degraded)
-          3. 이전 계획이 현재 위치부터 제동 거리(dstop)까지를 충분히 커버
-          4. 제동 거리 구간 동안 차체 영역이 최신 장애물 셀 및 벽과 겹치지 않음(plan_clear)
-        """
-        if old is None or old['bad'] or self.mpc.n_fail > 2 or (t - old['t']) >= 0.12:
-            return False
-        if self.loc_degraded:
-            return False
-        shift_s_old = s0 - old['st'][0]
-        chk_dist = max(self.estimator.dstop(vv), self.creep_chk, 0.5)
-        old_cum = old['cum']
-        c0 = float(np.interp(shift_s_old, old['st'] - old['st'][0], old_cum)) if shift_s_old > 0 else 0.0
-        if float(old_cum[-1]) < c0 + chk_dist:
-            return False
-        return self.detector.plan_clear(old, chk_dist, shift_s_old)
-
     def act(self, scan, x, y, yaw, v, yaw_rate, t):
         x, y, yaw, v, yaw_rate, t = float(x), float(y), float(yaw), float(v), float(yaw_rate), float(t)
         scan = np.asarray(scan, dtype=float)
@@ -429,7 +406,8 @@ class UnifiedCorridorMPC:
         if do_mpc:
             new = self._plan(t, st, X0, dpath, boxes, sides, s_block, w_h, pv, scan, lx, ly, yaw, vv)
             old = self.plan
-            if not (new['failed'] and not full and self._can_reuse_plan(old, t, s0, vv)):
+            if not (new['failed'] and old is not None and not old['bad'] and self.mpc.n_fail <= 2
+                    and not full and t - old['t'] < 0.12):
                 self.plan = new
 
         plan = self.plan

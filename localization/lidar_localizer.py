@@ -1,8 +1,5 @@
-"""LiDAR + 지도 + 제어 명령 기반 위치 추정 모듈 (GT 미사용).
+"""LiDAR + 지도 + 제어 명령 기반 위치 추정 모듈.
 
-기존 drivers/lidar_loc.py를 모듈화하고 다음 사항을 개선했다:
-- 하드코딩된 ~/forza_ws/race_stack/stack_master/maps 경로 제거 -> common.paths.resolve_maps_dir() 사용
-- 기본 inner 드라이버를 통합 단일 주행기(drivers.unified_corridor_mpc:UnifiedCorridorMPC)로 연결
 """
 import importlib
 import json
@@ -141,8 +138,6 @@ class LidarLocalizer:
         self.lost = False
         self.t_glob = -1e9
         self.q = 1.0
-        self.last_good_t = None
-        self.good_streak = 0
         self.last_info = None
         if not hasattr(self, 'rms_ema'):
             self.rms_ema = self.sig_b
@@ -171,7 +166,7 @@ class LidarLocalizer:
         return (np.array(self.Ht, dtype=np.float64), np.array(self.Hs, dtype=np.float64),
                 np.array(self.Hv, dtype=np.float64), n)
 
-    def init_pose(self, t, x, y, yaw, scan, refine=True, verified=True):
+    def init_pose(self, t, x, y, yaw, scan, refine=True):
         s = np.array([x, y, yaw, 0.0, 0.0, 0.0])
         q = 1.0
         if refine and scan is not None:
@@ -184,19 +179,7 @@ class LidarLocalizer:
         self.n_bad = 0
         self.lost = False
         self.q = q
-        if verified:
-            self.last_good_t = t
-            self.good_streak = 1
-        else:
-            self.last_good_t = None
-            self.good_streak = 0
         return q
-
-    def pose_std(self) -> float:
-        """현재 추정 위치(x, y)의 표준편차(불확실성, m)를 반환한다."""
-        if self.P is None:
-            return math.inf
-        return math.sqrt(max(float(self.P[0, 0]) + float(self.P[1, 1]), 0.0))
 
     def initialise(self, t, scan, pose0):
         if pose0 is None:
@@ -434,12 +417,9 @@ class LidarLocalizer:
             self.n_bad = 0
             self.rms_ema += self.sig_alpha * (rms - self.rms_ema)
             self.lost = False
-            self.last_good_t = t
-            self.good_streak += 1
         else:
             self.S, self.PP = S1, P1
             self.n_bad += 1
-            self.good_streak = 0
             if self.n_bad >= self.lost_n or q < self.q_lost:
                 self._select()
                 self._relocalise(t, scan)
@@ -466,8 +446,6 @@ class LidarLocalizer:
                 P[2, 2] = self.p0_yaw ** 2
             self._select()
             self.n_bad = 0
-            self.last_good_t = t
-            self.good_streak = 0  # 재위치추정 직후: 연속 정상 관측으로 검증될 때까지 재가속 제한
         self.q = q
 
 
@@ -481,23 +459,12 @@ def _load_kwargs(profile):
 
 
 class LidarLocDriver:
-    """LiDAR 위치 추정기와 내부 주행기(UnifiedCorridorMPC)를 결합하는 GT-free 래퍼.
-
-    위치추정 신뢰도 기반 안전 계층(Fail-Safe):
-      - 마지막 정상 정합 이후 경과시간, 연속 실패(n_bad), 위치 불확실성(pose_std)을 종합해
-        정상(OK) -> 감속(DEGRADED) -> 정지(STOP)로 단계적 전환한다.
-      - lost 또는 강제 초기화(init_force) 이후에는 연속 정상 관측(loc_recover_streak)이
-        확인되기 전까지 재가속을 제한한다.
-      - 중복 스캔(n_last == 0) 시 last_obs_valid=False를 표시해 상위 Watchdog이 감지할 수 있게 한다.
-    """
+    """LiDAR 위치 추정기와 내부 주행기(UnifiedCorridorMPC)를 결합하는 GT-free 래퍼."""
 
     def __init__(self, inner='drivers.unified_corridor_mpc:UnifiedCorridorMPC',
                  profile='profiles/berlin_unified.json',
                  inner_kwargs=None, init='start', forbid_gt=True, shadow=False, eval_log=False, record=False,
-                 loc=None, map_name=None, use_inner_c=True, init_force=10,
-                 allow_forced_init=True, loc_degrade_dt=0.15, loc_stop_dt=0.40,
-                 loc_degrade_bad=2, loc_uncert_degrade=0.18, loc_uncert_stop=0.45,
-                 loc_degrade_v=2.0, loc_forced_init_v=1.5, loc_recover_streak=4, **extra):
+                 loc=None, map_name=None, use_inner_c=True, init_force=10, **extra):
         kw = _load_kwargs(profile)
         kw.update(inner_kwargs or {})
         kw.update(extra)
@@ -519,21 +486,11 @@ class LidarLocDriver:
         self.eval_log, self.record = eval_log, record
         self.use_inner_c = use_inner_c
         self.init_force = init_force
-        self.allow_forced_init = bool(allow_forced_init)
-        self.loc_degrade_dt = float(loc_degrade_dt)
-        self.loc_stop_dt = float(loc_stop_dt)
-        self.loc_degrade_bad = int(loc_degrade_bad)
-        self.loc_uncert_degrade = float(loc_uncert_degrade)
-        self.loc_uncert_stop = float(loc_uncert_stop)
-        self.loc_degrade_v = float(loc_degrade_v)
-        self.loc_forced_init_v = float(loc_forced_init_v)
-        self.loc_recover_streak = int(loc_recover_streak)
         self.pending_pose = None
         self.n_gt_reads = 0
         self.n_resets = 0
         self.stats = dict(err=[], loc_ms=[], q=[], reloc=0, lost_calls=0, init_q=[], init_ms=[], tlat=[], c=[],
-                          free=[], dobs=[], boxes=0, phantom=0, phantom_calls=0, calls=0, dup=0,
-                          degraded_calls=0, stop_calls=0)
+                          free=[], dobs=[], boxes=0, phantom=0, phantom_calls=0, calls=0, dup=0)
         self.rec = []
         INSTANCES.append(self)
         self.reset()
@@ -546,10 +503,6 @@ class LidarLocDriver:
         self.t0 = None
         self.last_cmd = None
         self._issued = False
-        self.loc_state = 'OK'
-        self.loc_recovering = False
-        self._forced_init_active = False
-        self.last_obs_valid = False
         self.n_resets += 1
 
     def set_initial_pose(self, x, y, yaw):
@@ -564,10 +517,6 @@ class LidarLocDriver:
     @property
     def v_est(self):
         return float(self.loc.s[3]) if self.loc.s is not None else math.nan
-
-    @property
-    def loc_degraded(self) -> bool:
-        return self.loc_state != 'OK' or self.loc_recovering
 
     def _read_gt_once(self, x, y, yaw):
         if self.forbid_gt:
@@ -594,120 +543,57 @@ class LidarLocDriver:
         self.init_src = src
         return ok
 
-    def _eval_loc_safety(self) -> float:
-        """위치추정 신뢰도를 평가해 (OK / DEGRADED / STOP) 상태와 허용 최고 속도를 결정한다."""
-        loc = self.loc
-        if loc.t is not None and loc.last_good_t is not None:
-            dt_good = max(0.0, float(loc.t - loc.last_good_t))
-        else:
-            dt_good = math.inf
-        pos_std = loc.pose_std()
-
-        # 강제 초기화 직후에는 정합이 1회라도 성공하기 전까지 저속 출발만 허용 (즉시 정지 데드락 방지)
-        if self._forced_init_active and loc.last_good_t is None and not loc.lost:
-            self.loc_state = 'DEGRADED'
-            self.loc_recovering = True
-            self.stats['degraded_calls'] += 1
-            return self.loc_forced_init_v
-
-        if loc.lost or dt_good >= self.loc_stop_dt or pos_std >= self.loc_uncert_stop:
-            self.loc_state = 'STOP'
-            self.loc_recovering = True
-            self.stats['stop_calls'] += 1
-            return 0.0
-
-        if (loc.n_bad >= self.loc_degrade_bad or dt_good >= self.loc_degrade_dt
-                or pos_std >= self.loc_uncert_degrade):
-            self.loc_state = 'DEGRADED'
-            self.loc_recovering = True
-            self.stats['degraded_calls'] += 1
-            return self.loc_degrade_v
-
-        self.loc_state = 'OK'
-        if self.loc_recovering:
-            if loc.good_streak >= self.loc_recover_streak:
-                self.loc_recovering = False
-                self._forced_init_active = False
-                return math.inf
-            self.stats['degraded_calls'] += 1
-            return self.loc_forced_init_v if self._forced_init_active else self.loc_degrade_v
-        return math.inf
-
     def act(self, scan, x, y, yaw, v, yaw_rate, t):
         t = float(t)
         if self.t0 is None:
             self.t0 = t
         tr = t - self.t0
         t_a = time.perf_counter()
-        self.last_obs_valid = False
-
         if self.need_init:
             self.init_tries += 1
             if not self._initialise(tr, scan, x, y, yaw):
                 pose0 = self.pending_pose
-                if self.allow_forced_init and pose0 is not None and self.init_tries >= self.init_force:
-                    # 강제 초기화 시에도 즉시 고속 출발하지 않고, 연속 정합 확인 전까지 저속 출발만 허가
-                    self.loc.init_pose(tr, pose0[0], pose0[1], pose0[2], scan, refine=False, verified=False)
+                if pose0 is not None and self.init_tries >= self.init_force:
+                    self.loc.init_pose(tr, pose0[0], pose0[1], pose0[2], scan, refine=False)
                     self.pending_pose = None
-                    self._forced_init_active = True
-                    self.loc_recovering = True
                     self.stats['init_forced'] = self.stats.get('init_forced', 0) + 1
                 else:
                     return 0.0, 0.0
-            else:
-                self._forced_init_active = False
-                self.loc_recovering = False
             self.need_init = False
-            self.last_obs_valid = True
             est = (self.loc.s[0], self.loc.s[1], self.loc.s[2], 0.0, 0.0)
         else:
             t_lat = getattr(self.inner, 't_lat', self.loc.lat0)
             c = getattr(self.inner, 'c_tyre', 1.0) if self.use_inner_c else 1.0
             try:
                 est = self.loc.step(tr, scan, t_lat, c)
-            except (np.linalg.LinAlgError, ValueError, ZeroDivisionError):
+            except (np.linalg.LinAlgError, ValueError, ZeroDivisionError) as exc:
                 s_keep = self.loc.s.copy() if self.loc.s is not None else None
                 self.stats['loc_exc'] = self.stats.get('loc_exc', 0) + 1
-                self.loc_recovering = True
                 if s_keep is None or not np.isfinite(s_keep).all():
                     self.need_init = True
                     self.pending_pose = None
-                    return (self.last_cmd[0] if self.last_cmd is not None else 0.0), 0.0
+                    return self.last_cmd if self.last_cmd is not None else (0.0, 0.0)
                 self.loc._set_all(s_keep, self.loc.P0.copy(), self.loc.delta)
                 self.loc.t_wall = tr
-                self.loc.good_streak = 0
                 est = (s_keep[0], s_keep[1], s_keep[2], s_keep[3], s_keep[4])
-
             if self.loc.lost:
                 self.stats['lost_calls'] += 1
-
             if self.loc.n_last == 0 and self.last_cmd is not None and not self.shadow:
-                # 동일한 스캔 반복: 새 관측이 없으므로 last_obs_valid=False 유지 (상위 Watchdog 감지용)
                 self.stats['dup'] += 1
                 self._issued = False
-                speed_cap = self._eval_loc_safety()
-                return self.last_cmd[0], min(max(0.0, self.last_cmd[1]), speed_cap)
-
-            self.last_obs_valid = (not self.loc.lost) and (self.loc.n_last > 0)
+                return self.last_cmd
 
         loc_ms = (time.perf_counter() - t_a) * 1e3
         self.stats['loc_ms'].append(loc_ms)
         self.stats['q'].append(self.loc.q)
         self.stats['free'].append((getattr(self.loc, 'free_frac', 0.0), getattr(self.loc, 'free_unexpl', 0.0)))
-
-        speed_cap = self._eval_loc_safety()
-        if hasattr(self.inner, 'loc_degraded'):
-            self.inner.loc_degraded = self.loc_degraded
-
         if self.lat_own:
             self.inner.t_lat = self.loc.t_lat_est
         if self.shadow:
             steer, speed = self.inner.act(scan, x, y, yaw, v, yaw_rate, t)
         else:
             steer, speed = self.inner.act(scan, *est, self.loc.t)
-
-        # 후진 불가(>= 0.0) 및 위치추정 신뢰도 기반 속도 상한 적용
-        speed = min(max(0.0, float(speed)), speed_cap)
+        speed = max(0.0, float(speed))
         self.loc.add_command(self.loc.t, steer, speed)
         self.last_cmd = (steer, speed)
         self._issued = True

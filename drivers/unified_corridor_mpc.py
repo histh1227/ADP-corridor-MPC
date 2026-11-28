@@ -41,7 +41,7 @@ class UnifiedCorridorMPC:
             dp_near=0.6, p_near=30.0, w_dev=1.0, w_sl=2.0, w_cv=20.0, dp_kcap=0.8, dp_vfloor=2.0,
             w_soft=40.0, w_wall=10.0, p_flip=3.0, p_flip_hard=40.0, commit_t=0.45, commit_d=1.0,
             commit_ramp=1.5, young_t=0.15, dp_kgeo=0.95, w_geo=10.0, cluster_ds=3.0,
-            release_margin=0.0, hard_block_v=1.5, min_gap_w=0.10, min_gap_keep=0.0, gap_fallback=True,
+            release_margin=0.0, min_gap_w=0.10, min_gap_keep=0.0, gap_fallback=True,
             g_narrow=-1.0, g_diff=0.25,
             v_slow=-1.0, kcap_slow=1.1, kmax_slow=6, dp_adec_slow=5.0, slow_pre=2.0, slow_len=4.0,
             m_slow=0.1, slow_commit=None, a_lat_slow=0.0,

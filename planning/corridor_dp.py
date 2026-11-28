@@ -44,7 +44,6 @@ class CorridorDPPlanner:
         self.w_geo = float(p['w_geo'])
         self.cluster_ds = float(p['cluster_ds'])
         self.release_margin = float(p['release_margin'])
-        self.hard_block_v = float(p['hard_block_v'])
         self.min_gap_w = float(p['min_gap_w'])
         self.min_gap_keep = float(p['min_gap_keep'])
         self.gap_fallback = bool(p['gap_fallback'])
@@ -131,7 +130,8 @@ class CorridorDPPlanner:
             g_lo = (b[2] - w_h) - float(np.max(wlo))
             prev = self._prev_side(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]))
             dist = b[0] - (s0 + BOX_FRONT)
-            near = dist < dnear and v > self.hard_block_v
+            # 차량 바로 앞/옆 박스의 이미 고른 쪽은 속도와 무관하게 닫지 않는다
+            near = dist < dnear
             if g_hi < self.g_narrow and g_lo > g_hi + self.g_diff and not (near and prev == 1):
                 b2[3] = float(np.max(whi)) + 0.5
             elif g_lo < self.g_narrow and g_hi > g_lo + self.g_diff and not (near and prev == -1):
@@ -173,7 +173,9 @@ class CorridorDPPlanner:
                         break
             bprev[bi_] = prev
             bpf[bi_] = self.p_flip + (self.p_flip_hard - self.p_flip) * f
-            bhard[bi_] = hard and f >= 1.0 and dist < dnear and v > self.hard_block_v
+            # 가까운 박스의 통과 방향은 저속에서도 고정: 나란히 선 박스의 방향이 바뀌면 경로가 박스를 관통하고
+            # MPC가 해를 잃어 정지가 풀리지 않는다
+            bhard[bi_] = hard and f >= 1.0 and dist < dnear
 
         st, dpath, sides, s_block = _dp_k(
             float(s0), float(d0), float(chi0), float(v), self.n, self.ds, self.dp_ds, self.dd,

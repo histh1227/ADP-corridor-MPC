@@ -258,6 +258,9 @@ class CorridorDPPlanner:
             if r_[3] is None:
                 st, dpath, sides, s_block = r_
 
+        # 막힌 DP가 방향을 정하지 못한 박스는 MPC 통로용 임시 방향만 주고 기억하지 않는다
+        # (처음 보인 박스의 방향이 막힌 계획에서 고정되면, 감속 후 열리는 반대쪽을 다시 고르지 못한다)
+        tmp = set()
         if s_block is not None:
             for bi_, b in enumerate(boxes):
                 if sides[bi_] != 0:
@@ -265,7 +268,10 @@ class CorridorDPPlanner:
                 smid, dc = 0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3])
                 prev = self._prev_side(smid, dc)
                 sides[bi_] = prev if prev is not None else (1 if d0 > dc else -1)
+                if prev is None:
+                    tmp.add(bi_)
 
-        self.prev_sides = [(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]), sd) for b, sd in zip(boxes, sides) if sd != 0]
+        self.prev_sides = [(0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]), sd)
+                           for bi_, (b, sd) in enumerate(zip(boxes, sides)) if sd != 0 and bi_ not in tmp]
         self.weaves = self._compute_weaves(boxes, sides, w_h, s0) if self.a_weave > 0.0 else []
         return st, dpath, sides, s_block
